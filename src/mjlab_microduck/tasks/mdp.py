@@ -4588,8 +4588,23 @@ def maybe_set_random_prone_orientation(
     joint_random_prob: float = 0.0,
     joint_range_frac: float = 0.8,
     joint_random_extra_z: float = 0.06,
+    so3_prob: float = 0.0,
+    so3_extra_z: float = 0.04,
+    sit_prob: float = 0.0,
+    sit_params: Optional[dict] = None,
 ):
     """Reset event that overrides orientation to prone with probability `prone_prob`.
+
+    ``so3_prob`` (2026-10, velstand stand-up coverage): fraction of the prone
+    slice that gets a UNIFORMLY random orientation instead of an exact ±90°
+    one, always with randomized servo joints (head included) and
+    ``joint_random_extra_z + so3_extra_z`` of extra clearance — the robot drops
+    a few cm and lands in whatever rest state that pose gives. Covers the
+    "put down / fell somewhere odd" starts the ±90° HOME-joint spawns never show.
+
+    ``sit_prob``: an exclusive slice (after prone and crouch) reset into the
+    sitting bucket of ``set_random_ground_state`` with ``sit_params`` (joint
+    overrides, noise, tilt, z band).
 
     ``joint_random_extra_z``: extra spawn clearance for the joint-randomized
     envs. Randomly folded legs reach ~10 cm below the trunk; on rough terrain
@@ -4624,7 +4639,7 @@ def maybe_set_random_prone_orientation(
     into a random mid-recovery crouch via ``set_random_crouch_state`` (reverse
     curriculum for the recovery last mile — see its docstring).
     """
-    if prone_prob <= 0.0 and crouch_prob <= 0.0:
+    if prone_prob <= 0.0 and crouch_prob <= 0.0 and sit_prob <= 0.0:
         return
     # env_ids=None means "all envs" (the initial global reset passes None —
     # the old early-return silently skipped prone init there).
@@ -4637,6 +4652,7 @@ def maybe_set_random_prone_orientation(
     u = torch.rand(len(env_ids_t), device=env.device)
     selected = env_ids_t[u < prone_prob]
     crouch_selected = env_ids_t[(u >= prone_prob) & (u < prone_prob + crouch_prob)]
+    sit_selected = env_ids_t[(u >= prone_prob + crouch_prob) & (u < prone_prob + crouch_prob + sit_prob)]
     if len(selected) > 0:
         set_random_prone_orientation(
             env, selected, asset_cfg=asset_cfg, face_down_prob=face_down_prob, side_prob=side_prob
@@ -4644,13 +4660,32 @@ def maybe_set_random_prone_orientation(
         # Override z so the prone body has head/neck clearance when settling.
         z = torch.rand(len(selected), device=env.device) * (prone_z_max - prone_z_min) + prone_z_min
         env.sim.data.qpos[selected, 2] = z + _env_origin_z(env, selected)
-        if joint_random_prob > 0.0:
-            jr = selected[torch.rand(len(selected), device=env.device) < joint_random_prob]
+        so3 = torch.rand(len(selected), device=env.device) < so3_prob
+        if so3.any():
+            ids = selected[so3]
+            env.sim.data.qpos[ids, 3:7] = _uniform_random_quat(len(ids), env.device)
+            env.sim.data.qpos[ids, 2] += so3_extra_z
+        if joint_random_prob > 0.0 or so3.any():
+            jr = selected[(torch.rand(len(selected), device=env.device) < joint_random_prob) | so3]
             if len(jr) > 0:
                 randomize_servo_joints_uniform(env, jr, asset_cfg=asset_cfg, range_frac=joint_range_frac)
                 env.sim.data.qpos[jr, 2] += joint_random_extra_z
     if len(crouch_selected) > 0:
         set_random_crouch_state(env, crouch_selected, asset_cfg=asset_cfg)
+    if len(sit_selected) > 0:
+        set_random_ground_state(
+            env, sit_selected, asset_cfg=asset_cfg,
+            face_down_prob=0.0, face_up_prob=0.0, sitting_prob=1.0, standing_prob=0.0, **(sit_params or {}),
+        )
+
+
+def _uniform_random_quat(n: int, device) -> torch.Tensor:
+    """Uniform random unit quaternions (w, x, y, z) — Shoemake's method."""
+    a, b, c = torch.rand(n, 3, device=device).unbind(1)
+    return torch.stack([
+        torch.sqrt(1 - a) * torch.sin(2 * math.pi * b), torch.sqrt(1 - a) * torch.cos(2 * math.pi * b),
+        torch.sqrt(a) * torch.sin(2 * math.pi * c), torch.sqrt(a) * torch.cos(2 * math.pi * c),
+    ], dim=1)
 
 
 def event_param_curriculum(
