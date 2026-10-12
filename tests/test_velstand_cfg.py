@@ -554,3 +554,35 @@ def test_joint_masked_teacher_wired():
     else:
         assert not bc.get("expert_mask_cols")
     assert bc["coef"] == 1.0 and bc["anchor_coef"] == 1.0  # teacher strengths unchanged
+
+
+def test_remap_anchor_yaw_table_lookup():
+    from mjlab_microduck.tasks.distill import remap_anchor_yaw
+    t = vs.ANCHOR_YAW_REMAP
+    obs = torch.zeros(6, 61)
+    obs[:, 48:51] = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.3], [0.0, 0.0, -1.0], [0.2, 0.0, 0.6], [0.15, 0.0, 0.6], [0.3, 0.0, 0.0]])
+    obs[:, 0] = 7.0
+    out = remap_anchor_yaw(obs, (48, 51), t)
+    ti = lambda c: list(t["targets"]).index(c)
+    assert out[0, 50] == 0 and out[5, 50] == 0                                  # standing / straight walking unchanged
+    assert abs(out[1, 50].item() - t["pos"][0][ti(0.3)]) < 1e-5                   # knot hit, in place
+    assert abs(out[2, 50].item() + t["neg"][0][ti(1.0)]) < 1e-5                   # sign kept, own direction table
+    assert abs(out[3, 50].item() - t["pos"][2][ti(0.6)]) < 1e-5
+    mid = 0.5 * (t["pos"][1][ti(0.6)] + t["pos"][2][ti(0.6)])
+    assert abs(out[4, 50].item() - mid) < 1e-5                                   # linear in |v_xy| between knots
+    assert (out[:, :50] == obs[:, :50]).all() and (out[:, 51:] == obs[:, 51:]).all()  # only the yaw command changes
+    assert (obs[:, 50] != out[:, 50]).any() and obs[1, 50] == 0.3               # input untouched
+
+
+def test_anchor_yaw_remap_wired():
+    bc = vs.MicroduckVelStandRlCfg.algorithm.bc_cfg
+    if not vs.ENABLE_ANCHOR_YAW_REMAP:
+        assert not bc.get("anchor_yaw_remap")
+        return
+    assert bc["anchor_yaw_remap"] is vs.ANCHOR_YAW_REMAP and not bc.get("unanchor_turn_in_place")
+    t = vs.ANCHOR_YAW_REMAP
+    for key in ("pos", "neg"):
+        assert len(t[key]) == len(t["lin"]) and all(len(r) == len(t["targets"]) for r in t[key])
+        assert all(list(r) == sorted(r) and r[0] > 0 for r in t[key])            # monotone, never maps a turn to 0
+    cfg = vs.make_microduck_velstand_env_cfg()
+    assert cfg.rewards["track_yaw_fine"].weight > 0 and cfg.commands["twist"].turn_in_place_min_frac == vs.YAW_REMAP_TURN_IN_PLACE_MIN_FRAC

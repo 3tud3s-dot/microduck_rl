@@ -94,6 +94,17 @@ def default_bc_cfg() -> dict:
         # being trained out), and coef-1.0 BC pinned every earlier yaw fix. Separable:
         # the command is in the obs.
         "unanchor_turn_in_place": False,
+        # Teacher-side yaw remap (2026-10-12, branch improve_standup_velstand). The walk
+        # anchor has a yaw dead zone (in place: fed 0.6 → 0.0 rad/s, 1.0 → ~0.25; walking
+        # ≈ 0.6 × the command) and coef-1.0 BC copies it into every student. Unanchoring
+        # turn frames lost turning twice (sape62zb, brkpcnn8: PPO does not discover slow
+        # turning), but the anchor turns monotonically when fed a bigger yaw. So the anchor
+        # is fed the yaw command that makes IT achieve the student's commanded rate,
+        # looked up in a table calibrated on the anchor itself
+        # (claude_experiments/calibrate_walk_yaw.py): {"lin": |v_xy| knots, "targets":
+        # |wz| knots, "pos"/"neg": fed |wz| per (lin, target)}. A pure function of the obs,
+        # so labels stay consistent; zero yaw (standing, straight walking) is unchanged.
+        "anchor_yaw_remap": None,
         "body_active_axes": (2, 3, 4),
         "body_no_teacher_axes": (2,),
         # Flat actor-obs columns ZEROED in the stand expert's input on fallen frames (tilt >
@@ -160,6 +171,49 @@ def expert_input(
         rows = mask_rows.nonzero().flatten()
         out[rows.unsqueeze(1), cols.unsqueeze(0)] = 0.0
     return out
+
+
+def _interp_rows(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor) -> torch.Tensor:
+    """Piecewise-linear interpolation of x (n,) on knots xp (K,) for per-row values fp (n, K); x clamped to the knots."""
+    x = x.clamp(xp[0], xp[-1])
+    hi = torch.searchsorted(xp, x, right=True).clamp(1, xp.numel() - 1)
+    lo = hi - 1
+    w = (x - xp[lo]) / (xp[hi] - xp[lo])
+    return fp.gather(1, lo.unsqueeze(1)).squeeze(1) * (1 - w) + fp.gather(1, hi.unsqueeze(1)).squeeze(1) * w
+
+
+def remap_anchor_yaw(obs: torch.Tensor, twist_slice: tuple[int, int], table: dict) -> torch.Tensor:
+    """Copy of the flat obs with the yaw command replaced by the one the walk anchor needs to
+    actually turn at that rate (bilinear in |v_xy| and |wz|, sign kept, 0 → 0)."""
+    out = obs.clone()
+    tw = obs[:, twist_slice[0]:twist_slice[1]]
+    wz = tw[:, 2]
+    lin = tw[:, :2].norm(dim=1)
+    dev = obs.device
+    lk = torch.as_tensor(table["lin"], dtype=obs.dtype, device=dev)
+    tk = torch.as_tensor([0.0, *table["targets"]], dtype=obs.dtype, device=dev)
+    fed = torch.zeros_like(wz)
+    for key, sign in (("pos", 1.0), ("neg", -1.0)):
+        rows = (wz * sign) > 0
+        if not rows.any():
+            continue
+        grid = torch.as_tensor([[0.0, *r] for r in table[key]], dtype=obs.dtype, device=dev)  # (L, K)
+        c = wz[rows].abs()
+        n = c.numel()
+        per_lin = torch.stack([_interp_rows(c, tk, grid[i].expand(n, -1)) for i in range(lk.numel())], dim=1)  # (n, L)
+        fed[rows] = sign * _interp_rows(lin[rows], lk, per_lin)
+    out[:, twist_slice[0] + 2] = fed
+    return out
+
+
+def _with_flat(td: TensorDict, groups: list[str], flat: torch.Tensor) -> TensorDict:
+    """Rebuild the obs groups of ``td`` from a modified flat obs."""
+    off = 0
+    for g in groups:
+        d = td[g].shape[-1]
+        td[g] = flat[:, off:off + d]
+        off += d
+    return td
 
 
 def load_expert_from(actor: torch.nn.Module, state_dict: dict) -> torch.nn.Module:
@@ -251,14 +305,15 @@ class PpoWithExpertBc(PPO):
                 exp_td = obs_td[fallen].clone()
                 exp_flat = expert_input(torch.cat([exp_td[g] for g in groups], dim=-1), tuple(cfg["twist_slice"]),
                                         tuple(cfg.get("expert_mask_cols", ())), tilted[fallen])
-                off = 0
-                for g in groups:  # rebuild the groups from the twist-zeroed flat obs
-                    d = exp_td[g].shape[-1]
-                    exp_td[g] = exp_flat[:, off:off + d]
-                    off += d
-                target[fallen] = self.expert(exp_td)
+                target[fallen] = self.expert(_with_flat(exp_td, groups, exp_flat))
             if (~fallen).any():
-                target[~fallen] = self.anchor(obs_td[~fallen])
+                anc_td = obs_td[~fallen]
+                if cfg.get("anchor_yaw_remap"):
+                    anc_td = anc_td.clone()
+                    anc_flat = remap_anchor_yaw(torch.cat([anc_td[g] for g in groups], dim=-1), tuple(cfg["twist_slice"]),
+                                                cfg["anchor_yaw_remap"])
+                    anc_td = _with_flat(anc_td, groups, anc_flat)
+                target[~fallen] = self.anchor(anc_td)
         n = idx.numel()
         mb = max(cfg.get("min_mini_batch", 1), n // cfg["mini_batches"])
         total = 0.0

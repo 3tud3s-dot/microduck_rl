@@ -364,6 +364,42 @@ TRACK_YAW_FINE_WEIGHT = 2.0
 TURN_IN_PLACE_FRACTION_VELSTAND = 0.2    # velocity recipe: 0.15
 TURN_IN_PLACE_MIN_FRAC = 0.1             # velocity recipe: 0.4
 
+# Teacher-side yaw remap (2026-10-12). Robot (qz5g3bwi@1750, good stand-up): "still
+# pretty bad at yaw turning". Sim (velstand_yaw_probe.py, backlash): in place 0.3 / 0.6
+# → 0.00 / ±0.05 rad/s, 1.0 → 0.34 / −0.42; walking 0.2 m/s ≈ half the command — and the
+# WALK ANCHOR has the same curve (in place 0.6 → 0.01, 1.0 → 0.35 / −0.19), which BC
+# coef 1.0 copies. Both turn monotonically when fed a bigger yaw (no falls up to 2.4).
+# Unanchoring turn frames lost turning twice (ENABLE_YAW_FIX runs above), so instead the
+# anchor is fed the command that makes IT turn at the student's commanded rate: inverse
+# of its measured response (claude_experiments/calibrate_walk_yaw.py --backlash, 441tzs6d
+# @3750 as distill loads it, 8 envs per cell, 0 falls). Rows = |v_xy| knots, columns =
+# target |wz| knots, values = fed |wz|; "pos"/"neg" per turn direction (the anchor is
+# asymmetric). Standing and straight walking (wz = 0) are unchanged, fallen frames use the
+# stand expert → the stand-up is untouched. Plus the fine yaw-only term (reward agrees
+# with the labels; the stock term preferred standing still at 0.3 in place) and a
+# turn-in-place bucket reaching down to 0.2 rad/s.
+ENABLE_ANCHOR_YAW_REMAP = True
+ANCHOR_YAW_REMAP = {
+    "lin": (0.0, 0.1, 0.2, 0.3, 0.4),
+    "targets": (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+    "pos": (
+        (0.75, 0.89, 1.00, 1.06, 1.11, 1.17, 1.25, 1.38, 1.67, 1.95),
+        (0.80, 0.85, 0.89, 0.94, 0.99, 1.12, 1.27, 1.39, 1.67, 1.87),
+        (0.28, 0.45, 0.55, 0.68, 0.86, 1.06, 1.26, 1.44, 1.55, 1.85),
+        (0.21, 0.32, 0.47, 0.68, 0.86, 1.05, 1.23, 1.39, 1.51, 1.77),
+        (0.19, 0.39, 0.62, 0.72, 0.82, 0.97, 1.25, 1.37, 1.51, 1.72),
+    ),
+    "neg": (
+        (0.90, 1.01, 1.07, 1.13, 1.19, 1.31, 1.46, 1.70, 1.94, 2.16),
+        (0.71, 0.81, 0.89, 0.96, 1.08, 1.29, 1.49, 1.67, 1.88, 2.08),
+        (0.25, 0.49, 0.67, 0.80, 1.04, 1.17, 1.41, 1.58, 1.81, 1.90),
+        (0.23, 0.38, 0.60, 0.77, 0.92, 1.10, 1.33, 1.49, 1.62, 1.83),
+        (0.17, 0.30, 0.44, 0.64, 0.85, 1.02, 1.15, 1.42, 1.60, 1.73),
+    ),
+}
+YAW_REMAP_TURN_IN_PLACE_FRACTION = 0.2   # velocity recipe: 0.15
+YAW_REMAP_TURN_IN_PLACE_MIN_FRAC = 0.2   # velocity recipe: 0.4 (in-place |wz| < 0.4 never trained)
+
 # Stand-up coverage (2026-10-07, branch improve_standup_velstand). Robot: get-ups
 # sometimes fail, and the robot sometimes stays stuck without trying again.
 # Measured on v7 (j4i6yoq2@1250, claude_experiments/velstand_rise_battery.py,
@@ -578,6 +614,16 @@ def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> 
         tw = cfg.commands["twist"]
         tw.rel_turn_in_place_envs = TURN_IN_PLACE_FRACTION_VELSTAND
         tw.turn_in_place_min_frac = TURN_IN_PLACE_MIN_FRAC
+        cfg.rewards["track_yaw_fine"] = RewardTermCfg(
+            func=microduck_mdp.track_yaw_rate_fine,
+            weight=TRACK_YAW_FINE_WEIGHT,
+            params={"std": TRACK_YAW_FINE_STD, "command_name": cfg.rewards["track_angular_velocity"].params["command_name"]},
+        )
+    if ENABLE_ANCHOR_YAW_REMAP:
+        assert not ENABLE_YAW_FIX, "the remap needs the turn frames ON the walk anchor"
+        tw = cfg.commands["twist"]
+        tw.rel_turn_in_place_envs = YAW_REMAP_TURN_IN_PLACE_FRACTION
+        tw.turn_in_place_min_frac = YAW_REMAP_TURN_IN_PLACE_MIN_FRAC
         cfg.rewards["track_yaw_fine"] = RewardTermCfg(
             func=microduck_mdp.track_yaw_rate_fine,
             weight=TRACK_YAW_FINE_WEIGHT,
@@ -946,6 +992,7 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
             **default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG,
             **({"body_slice": (55, 61)} if ENABLE_BODY_CONTROL else {}),
             **({"unanchor_turn_in_place": True} if ENABLE_YAW_FIX else {}),
+            **({"anchor_yaw_remap": ANCHOR_YAW_REMAP} if ENABLE_ANCHOR_YAW_REMAP else {}),
             **({"expert_mask_cols": TEACHER_MASK_COLS, "expert_mask_tilt_deg": TEACHER_MASK_TILT_DEG} if ENABLE_JOINT_MASKED_TEACHER else {}),
         } if ENABLE_EXPERT_BC else None,
     ),
